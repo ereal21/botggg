@@ -20,11 +20,17 @@ async def start(update: Update, context: CallbackContext):
     except Exception as e:
         config.logger.warning(f"Could not log user ID: {e}")
 
+
     welcome_text = config.get_welcome_text(
         lang,
         username=username,
         plan=plan,
         balance=f"{balance:.2f}",
+
+
+    welcome_text = config.translations.get(lang, config.translations['en'])['welcome'].format(
+        username=username, plan=plan, balance=f"{balance:.2f}"
+
     )
     keyboard = [
         [InlineKeyboardButton(config.translations[lang]['search_button'], callback_data="search")],
