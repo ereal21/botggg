@@ -3,6 +3,17 @@ import asyncio
 import logging
 from flask import Flask
 import nowpayments
+from dotenv import load_dotenv
+
+# Load environment variables from .env if present
+load_dotenv()
+
+# Logger
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
 
 # Logger
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -15,10 +26,20 @@ WEBHOOK_URL = os.getenv("NGROK_URL", "") + "/nowpayments-webhook"
 app_web = Flask(__name__)
 
 # Core configuration
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+SEARCHER_BIN = os.getenv(
+    "SEARCHER_BIN",
+    r"B:\\Indexing\\tantivy_searcher\\tantivy_searcher\\target\\release\\tantivy_searcher.exe",
+)
+TANTIVY_INDEX = os.getenv("TANTIVY_INDEX", r"Z:\\as")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7932293544:AAGw8UmQ5pdwC0Bi28690yIczmoq3IIk7fg")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SEARCHER_BIN = r"B:\\Indexing\\tantivy_searcher\\tantivy_searcher\\target\\release\\tantivy_searcher.exe"
 TANTIVY_INDEX = r"Z:\\as"
+
 
 ACCESS_USERS = {"Inereal", "Penguinite", "KN0O7", "CoreyD6", "Kqizen"}
 ADMIN_USERS = {"Inereal"}
@@ -64,6 +85,16 @@ COINGECKO_IDS = {
     "USDC_ETH": "usd-coin", "TON": "the-open-network", "BCH": "bitcoin-cash",
     "ETC": "ethereum-classic", "XMR": "monero"
 }
+
+
+
+def get_welcome_text(lang: str, username: str, plan: str, balance: str) -> str:
+    """Return the formatted welcome text for the user."""
+    template = translations.get(lang, translations['en'])['welcome']
+    if isinstance(template, (tuple, list)):
+        template = ''.join(template)
+    return template.format(username=username, plan=plan, balance=balance)
+
 
 translations = {
     'en': {

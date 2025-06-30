@@ -148,8 +148,16 @@ async def button_callback(update: Update, context: CallbackContext):
     if data == "back_to_main":
         plan = "Active" if has_active_subscription(user) else "None"
         balance = config.user_balances.get(user, 0.0)
+
+        welcome_text = config.get_welcome_text(
+            lang,
+            username=user,
+            plan=plan,
+            balance=f"{balance:.2f}",
+
         welcome_text = config.translations[lang]['welcome'].format(
             username=user, plan=plan, balance=f"{balance:.2f}"
+
         )
         keyboard = [
             [InlineKeyboardButton(config.translations[lang]['search_button'], callback_data="search"),
