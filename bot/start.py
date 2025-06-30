@@ -27,6 +27,7 @@ async def start(update: Update, context: CallbackContext):
         plan=plan,
         balance=f"{balance:.2f}",
 
+
     welcome_text = config.translations.get(lang, config.translations['en'])['welcome'].format(
         username=username, plan=plan, balance=f"{balance:.2f}"
 
