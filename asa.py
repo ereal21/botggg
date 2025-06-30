@@ -11,6 +11,9 @@ import qrcode
 import random
 import math
 from datetime import datetime
+from flask import Flask, request, jsonify
+import nowpayments
+from threading import Thread
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -62,18 +65,15 @@ def get_crypto_amount(usd_amount, coin_id):
     crypto_price = price_data[coin_id]['usd']
     return usd_amount / crypto_price
 
-def has_active_subscription(username: str) -> bool:
+def has_active_subscription(username: str, cost: float = 0.0) -> bool:
     if not username:
         return False
     if username in ACCESS_USERS:
-        return True  # Treat ACCESS_USERS as permanently subscribed
-    expiry = user_subscriptions.get(username)
-    return expiry is not None and time.time() < expiry
-
+        return True
+    return user_balances.get(username, 0.0) >= cost
 def time_until_next_search(username: str) -> float:
     last_time = search_cooldowns.get(username, 0)
     return max(0, COOLDOWN_HOURS * 3600 - (time.time() - last_time))
-
 # ======== Logger definition ========
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -81,6 +81,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+NP_CLIENT = nowpayments.Client(api_key=os.getenv("NOWPAYMENTS_API_KEY"))
+WEBHOOK_URL = os.getenv("NGROK_URL", "") + "/nowpayments-webhook"
+app_web = Flask(__name__)
+@app_web.route("/nowpayments-webhook", methods=["POST"])
+def nowpayments_ipn():
+    data = request.get_json()
+    invoice_id = data.get("invoice_id")
+    order_id = data.get("order_id")
+    status = data.get("payment_status")
+    amount_usd = data.get("price_amount")
+    username = order_id.split(":")[0] if order_id else ""
+    if status == "confirmed":
+        user_balances[username] = user_balances.get(username, 0.0) + float(amount_usd)
+    return jsonify({"status": "ok"})
 # ======== Configuration ========
 BOT_TOKEN = os.getenv("BOT_TOKEN", 
 "7932293544:AAGw8UmQ5pdwC0Bi28690yIczmoq3IIk7fg")
@@ -98,6 +112,7 @@ BANNED_TOKENS = [
 
 MAX_UPLOAD = 19 * 1024 * 1024  # 20 MB
 
+SEARCH_COST = 1.0  # USD cost per search
 SUBSCRIPTIONS = {
     "1_day":    {"label": "🪵 1 Day - $14.99",       "price": 14.99},
     "1_week":   {"label": "⚙️ 1 Week - $29.99",   "price": 29.99},
@@ -242,6 +257,7 @@ canceled_searches = set()
 search_cooldowns = {}
 user_subscriptions = {}
 COOLDOWN_HOURS = 4
+user_balances = {}
 
 async def start(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
@@ -356,6 +372,11 @@ async def search_command(update: Update, context: CallbackContext):
         search_cooldowns[user] = time.time()
 
     context.user_data["awaiting_query"] = False
+    if user not in ACCESS_USERS:
+        if not has_active_subscription(user, SEARCH_COST):
+            await update.message.reply_text(f"❌ You need at least ${SEARCH_COST} in balance. Use /topup to add.")
+            return
+        user_balances[user] = user_balances.get(user, 0.0) - SEARCH_COST
     context.user_data["prompt_id"] = None
     search_in_progress.add(chat_id)
     fmt = context.user_data.get("result_format", "txt")
@@ -416,6 +437,31 @@ async def handle_broadcast(update: Update, context: CallbackContext):
     await update.message.reply_text(f"✅ Broadcast sent to {success} users.")
     return True
 
+async def balance_cmd(update: Update, context: CallbackContext):
+    user = update.effective_user.username or str(update.effective_user.id)
+    bal = user_balances.get(user, 0.0)
+    await update.message.reply_text(f"💰 Your balance: ${bal:.2f}")
+
+async def topup_cmd(update: Update, context: CallbackContext):
+    if not context.args:
+        return await update.message.reply_text("Usage: /topup <amount>")
+    try:
+        amount = float(context.args[0])
+    except ValueError:
+        return await update.message.reply_text("Invalid amount.")
+    username = update.effective_user.username or str(update.effective_user.id)
+    order_id = f"{username}:{random.randint(100000,999999)}"
+    invoice = NP_CLIENT.create_invoice({
+        "price_amount": amount,
+        "price_currency": "usd",
+        "pay_currency": "btc",
+        "order_id": order_id,
+        "ipn_callback_url": WEBHOOK_URL
+    })
+    await update.message.reply_text(
+        f"*💸 Invoice Created*\n\nAmount: `{invoice.price_amount} {invoice.price_currency}`\n[Pay Here]({invoice.invoice_url})\n\n_You’ll be credited once payment is confirmed._",
+        parse_mode="Markdown"
+    )
 async def button_callback(update: Update, context: CallbackContext):
     q = update.callback_query
     await q.answer()
@@ -640,7 +686,7 @@ async def button_callback(update: Update, context: CallbackContext):
 
 
     elif data.startswith("pay_"):
-        from datetime import timedelta  # Ensure this import exists at the top
+
         method = data.split("_", 1)[1]
         plan_type, plan_key = context.user_data.get("pending_plan", (None, None))
 
@@ -652,82 +698,28 @@ async def button_callback(update: Update, context: CallbackContext):
             await q.answer("❌ Plan not found.", show_alert=True)
             return
 
-        coin_id = COINGECKO_IDS.get(method)
-        if not coin_id or not plan:
-            await q.answer("❌ Invalid payment method or plan.", show_alert=True)
-            return
-
         try:
-            usd = plan["price"]
-            crypto_amt = get_crypto_amount(usd, coin_id)
-            address = PAYMENT_METHODS[method]["address"]
-            qr = qrcode.make(address)
-            qr_buf = io.BytesIO(); qr.save(qr_buf); qr_buf.seek(0)
-
-            username = q.from_user.username or q.from_user.first_name
-            user_id = q.from_user.id
-            order_id = random.randint(100000, 999999)
-            now = datetime.utcnow()
-            expiry = (now + timedelta(minutes=30)).strftime("%H:%M:%S UTC")
-
-            # Save for later confirmation
-            context.user_data["last_payment_info"] = {
-                "plan_type": plan_type,
-                "plan_key": plan_key,
-                "username": username,
-                "user_id": user_id
-            }
-
-            caption = (
-                "*💸 Payment Invoice*\n\n"
-                "Please send the following amount:\n"
-                f"*Amount:* ` {crypto_amt:.8f} {method} `\n\n"
-                "*Payment Address:*\n"
-                f"`{address}`\n\n"
-                f"⏰ *Expires At:* {expiry}\n"
-                "🛠 After 1–2 confirmations, your access should activate.\n"
-                "❓ If not, please contact [@Inereal](https://t.me/Inereal)."
-            )
-
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=qr_buf,
-                caption=caption,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ I Paid", callback_data="confirm_paid"),
-                     InlineKeyboardButton("❌ Cancel", callback_data="cancel_payment")]
-                ])
-            )
-
+            username = q.from_user.username or str(q.from_user.id)
+            order_id = f"{username}:{random.randint(100000,999999)}"
+            invoice = NP_CLIENT.create_invoice({
+                "price_amount": plan["price"],
+                "price_currency": "usd",
+                "pay_currency": method.lower(),
+                "order_id": order_id,
+                "ipn_callback_url": WEBHOOK_URL
+            })
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="⏳ Waiting for payment confirmation...\nPlease transfer the funds within 30 minutes.",
+                text=(
+                    f"*💸 Invoice Created*\n\n"
+                    f"Amount: `{invoice.price_amount} {invoice.price_currency}`\n"
+                    f"[Pay Here]({invoice.invoice_url})\n\n"
+                    "_You’ll be credited once payment is confirmed._"
+                ),
                 parse_mode="Markdown"
             )
-
-            # Notify admin channel
-            notify = (
-                f"🔔 *New Subscription Order*\n\n"
-                f"🆔 *Order ID:* `{order_id}`\n"
-                f"📋 *Subscription:* 💰 {plan['label']} 💰\n"
-                f"💳 *Payment Method:* {method.capitalize()}\n\n"
-                f"👤 *Username:* @{username}\n"
-                f"🧾 *ID:* `{user_id}`\n"
-                f"📅 *Order Date:* {now}"
-            )
-            await context.bot.send_message(
-                chat_id=-1002361956797,
-                text=notify,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Confirm", callback_data=f"admin_confirm_{user_id}")]
-                ])
-            )
-
         except Exception as e:
             await q.edit_message_text(f"❌ Payment error: {e}")
-
 
 
     elif data == "back_to_main":
@@ -773,16 +765,22 @@ async def handle_search(update: Update, context: CallbackContext):
 
         # clear the flag
         context.user_data["awaiting_query"] = False
+    if user not in ACCESS_USERS:
+        if not has_active_subscription(user, SEARCH_COST):
+            await update.message.reply_text(f"❌ You need at least ${SEARCH_COST} in balance. Use /topup to add.")
+            return
+        user_balances[user] = user_balances.get(user, 0.0) - SEARCH_COST
 
         # read query, format & size
         query  = text
         fmt    = context.user_data.get("result_format", "txt")
         max_mb = context.user_data.get("max_size_mb", MAX_UPLOAD // (1024*1024))
 
-        # demo‐user cooldown
-        if not has_active_subscription(user) and user not in ACCESS_USERS:
-            search_cooldowns[user] = time.time()
-
+        if user not in ACCESS_USERS:
+            if not has_active_subscription(user, SEARCH_COST):
+                await update.message.reply_text(f"❌ You need at least ${SEARCH_COST} in balance. Use /topup to add.")
+                return
+            user_balances[user] = user_balances.get(user, 0.0) - SEARCH_COST
         # enqueue & notify
         pos = search_queue.qsize() + 1
         search_in_progress.add(chat_id)
@@ -820,8 +818,11 @@ async def handle_search(update: Update, context: CallbackContext):
         fmt    = context.user_data.get("result_format", "txt")
         max_mb = context.user_data.get("max_size_mb", MAX_UPLOAD // (1024*1024))
 
-        if not has_active_subscription(user) and user not in ACCESS_USERS:
-            search_cooldowns[user] = time.time()
+        if user not in ACCESS_USERS:
+            if not has_active_subscription(user, SEARCH_COST):
+                await update.message.reply_text(f"❌ You need at least ${SEARCH_COST} in balance. Use /topup to add.")
+                return
+            user_balances[user] = user_balances.get(user, 0.0) - SEARCH_COST
 
         pos = search_queue.qsize() + 1
         await update.message.reply_text(
@@ -842,6 +843,11 @@ async def handle_search(update: Update, context: CallbackContext):
         return
 
     context.user_data["awaiting_query"] = False
+    if user not in ACCESS_USERS:
+        if not has_active_subscription(user, SEARCH_COST):
+            await update.message.reply_text(f"❌ You need at least ${SEARCH_COST} in balance. Use /topup to add.")
+            return
+        user_balances[user] = user_balances.get(user, 0.0) - SEARCH_COST
     await search_queue.put((
         update.effective_chat.id,
         query,
@@ -1079,10 +1085,12 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("addlist", addlist))
     app.add_handler(CommandHandler("broadcast", broadcast))
-    # app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("topup", topup_cmd))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
     app.run_polling()
-
+    
 if __name__ == "__main__":
+    Thread(target=lambda: app_web.run(port=5000)).start()
     main()
